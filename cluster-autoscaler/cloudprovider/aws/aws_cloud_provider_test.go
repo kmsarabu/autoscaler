@@ -18,6 +18,7 @@ package aws
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -536,6 +537,95 @@ func TestDeleteNodesWithPlaceholder(t *testing.T) {
 		},
 	).Return(&autoscaling.DescribeScalingActivitiesOutput{}, nil)
 
+	a.On("DescribeScalingActivities",
+		&autoscaling.DescribeScalingActivitiesInput{
+			AutoScalingGroupName: aws.String("test-asg"),
+			MaxRecords:           aws.Int64(1),
+		},
+	).Return(
+		&autoscaling.DescribeScalingActivitiesOutput{
+			Activities: []*autoscaling.Activity{
+				{
+					StatusCode: aws.String("Successful"),
+					StartTime:  aws.Time(time.Now().Add(-10 * time.Minute)),
+				},
+				{
+					StatusCode: aws.String("Failed"),
+					StartTime:  aws.Time(time.Now().Add(-30 * time.Minute)),
+				},
+			},
+		}, nil).Once()
+
+	provider.Refresh()
+
+	initialSize, err := asgs[0].TargetSize()
+	assert.NoError(t, err)
+	assert.Equal(t, 2, initialSize)
+
+	node := &apiv1.Node{
+		Spec: apiv1.NodeSpec{
+			ProviderID: "aws:///us-east-1a/i-placeholder-test-asg-1",
+		},
+	}
+	err = asgs[0].DeleteNodes([]*apiv1.Node{node})
+	assert.NoError(t, err)
+	a.AssertNumberOfCalls(t, "SetDesiredCapacity", 0)
+	a.AssertNumberOfCalls(t, "DescribeAutoScalingGroupsPages", 1)
+
+	newSize, err := asgs[0].TargetSize()
+	assert.NoError(t, err)
+	assert.Equal(t, 2, newSize)
+
+}
+
+func TestDeleteNodesWithPlaceholderASGFailure(t *testing.T) {
+	a := &autoScalingMock{}
+	provider := testProvider(t, newTestAwsManagerWithAsgs(t, a, nil, []string{"1:5:test-asg"}))
+	asgs := provider.NodeGroups()
+
+	a.On("SetDesiredCapacity", &autoscaling.SetDesiredCapacityInput{
+		AutoScalingGroupName: aws.String(asgs[0].Id()),
+		DesiredCapacity:      aws.Int64(1),
+		HonorCooldown:        aws.Bool(false),
+	}).Return(&autoscaling.SetDesiredCapacityOutput{})
+
+	// Look up the current number of instances...
+	var expectedInstancesCount int64 = 2
+	a.On("DescribeAutoScalingGroupsPages",
+		&autoscaling.DescribeAutoScalingGroupsInput{
+			AutoScalingGroupNames: aws.StringSlice([]string{"test-asg"}),
+			MaxRecords:            aws.Int64(maxRecordsReturnedByAPI),
+		},
+		mock.AnythingOfType("func(*autoscaling.DescribeAutoScalingGroupsOutput, bool) bool"),
+	).Run(func(args mock.Arguments) {
+		fn := args.Get(1).(func(*autoscaling.DescribeAutoScalingGroupsOutput, bool) bool)
+		fn(testNamedDescribeAutoScalingGroupsOutput("test-asg", expectedInstancesCount, "test-instance-id"), false)
+		// we expect the instance count to be 1 after the call to DeleteNodes
+		expectedInstancesCount = 1
+	}).Return(nil)
+
+	a.On("DescribeScalingActivities",
+		&autoscaling.DescribeScalingActivitiesInput{
+			AutoScalingGroupName: aws.String("test-asg"),
+		},
+	).Return(&autoscaling.DescribeScalingActivitiesOutput{}, nil)
+
+	a.On("DescribeScalingActivities",
+		&autoscaling.DescribeScalingActivitiesInput{
+			AutoScalingGroupName: aws.String("test-asg"),
+			MaxRecords:           aws.Int64(1),
+		},
+	).Return(
+		&autoscaling.DescribeScalingActivitiesOutput{
+			Activities: []*autoscaling.Activity{
+				{
+					StatusCode:    aws.String("Failed"),
+					StatusMessage: aws.String("InsufficientCapacity"),
+					StartTime:     aws.Time(time.Now().Add(-30 * time.Minute)),
+				},
+			},
+		}, nil).Once()
+
 	provider.Refresh()
 
 	initialSize, err := asgs[0].TargetSize()
@@ -555,6 +645,7 @@ func TestDeleteNodesWithPlaceholder(t *testing.T) {
 	newSize, err := asgs[0].TargetSize()
 	assert.NoError(t, err)
 	assert.Equal(t, 1, newSize)
+
 }
 
 func TestDeleteNodesAfterMultipleRefreshes(t *testing.T) {
